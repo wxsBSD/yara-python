@@ -67,7 +67,7 @@ static PyObject* YaraWarningError = NULL;
 This module allows you to apply YARA rules to files or strings.\n\
 \n\
 For complete documentation please visit:\n\
-https://plusvic.github.io/yara\n"
+https://virustotal.github.io/yara/"
 
 #if defined(_WIN32) || defined(__CYGWIN__)
 #include <string.h>
@@ -907,8 +907,18 @@ static size_t flo_write(
 
 PyObject* handle_error(
     int error,
-    char* extra)
+    char* extra,
+    YR_SCANNER* scanner)
 {
+  YR_RULE* rule = NULL;
+  YR_STRING* string = NULL;
+
+  if (scanner != NULL)
+  {
+    rule = yr_scanner_last_error_rule(scanner);
+    string = yr_scanner_last_error_string(scanner);
+  }
+
   switch(error)
   {
     case ERROR_COULD_NOT_ATTACH_TO_PROCESS:
@@ -951,7 +961,49 @@ PyObject* handle_error(
           YaraError,
           "rules file \"%s\" is incompatible with this version of YARA",
           extra);
+    case ERROR_TOO_MANY_MATCHES:
+      if (scanner != NULL)
+      {
+        if (rule != NULL && string != NULL)
+        {
+          return PyErr_Format(
+              YaraError,
+              "string \"%s\" in rule \"%s\" caused too many matches",
+              string->identifier,
+              rule->identifier);
+        }
+        else if (rule != NULL)
+        {
+          return PyErr_Format(
+              YaraError,
+              "rule \"%s\" caused too many matches",
+              rule->identifier);
+        }
+      }
+      return PyErr_Format(
+          YaraError,
+          "too many matches");
     default:
+      if (scanner != NULL)
+      {
+        if (rule != NULL && string != NULL)
+        {
+          return PyErr_Format(
+              YaraError,
+              "string \"%s\" in rule \"%s\" caused internal error: %d",
+              string->identifier,
+              rule->identifier,
+              error);
+        }
+        else if (rule != NULL)
+        {
+          return PyErr_Format(
+              YaraError,
+              "rule \"%s\" caused internal error: %d",
+              rule->identifier,
+              error);
+        }
+      }
       return PyErr_Format(
           YaraError,
           "internal error: %d",
@@ -1021,7 +1073,7 @@ int process_compile_externals(
 
     if (result != ERROR_SUCCESS)
     {
-      handle_error(result, identifier);
+      handle_error(result, identifier, NULL);
       return result;
     }
   }
@@ -1032,7 +1084,7 @@ int process_compile_externals(
 
 int process_match_externals(
     PyObject* externals,
-    YR_RULES* rules)
+    YR_SCANNER* scanner)
 {
   PyObject* key;
   PyObject* value;
@@ -1047,8 +1099,8 @@ int process_match_externals(
 
     if (PyBool_Check(value))
     {
-      result = yr_rules_define_boolean_variable(
-          rules,
+      result = yr_scanner_define_boolean_variable(
+          scanner,
           identifier,
           PyObject_IsTrue(value));
     }
@@ -1058,15 +1110,15 @@ int process_match_externals(
     else if (PyLong_Check(value) || PyInt_Check(value))
 #endif
     {
-      result = yr_rules_define_integer_variable(
-          rules,
+      result = yr_scanner_define_integer_variable(
+          scanner,
           identifier,
           PyLong_AsLong(value));
     }
     else if (PyFloat_Check(value))
     {
-      result = yr_rules_define_float_variable(
-          rules,
+      result = yr_scanner_define_float_variable(
+          scanner,
           identifier,
           PyFloat_AsDouble(value));
     }
@@ -1077,8 +1129,8 @@ int process_match_externals(
       if (str == NULL)
         return ERROR_INVALID_ARGUMENT;
 
-      result = yr_rules_define_string_variable(
-          rules, identifier, str);
+      result = yr_scanner_define_string_variable(
+          scanner, identifier, str);
     }
     else
     {
@@ -1089,7 +1141,7 @@ int process_match_externals(
       return ERROR_INVALID_ARGUMENT;
     }
 
-    // yr_rules_define_xxx_variable returns ERROR_INVALID_ARGUMENT if the
+    // yr_scanner_define_xxx_variable returns ERROR_INVALID_ARGUMENT if the
     // variable wasn't previously defined in the compilation phase. Ignore
     // those errors because we don't want the "scan" method being aborted
     // because of the "externals" dictionary having more keys than those used
@@ -1098,7 +1150,7 @@ int process_match_externals(
     if (result != ERROR_SUCCESS &&
         result != ERROR_INVALID_ARGUMENT)
     {
-      handle_error(result, identifier);
+      handle_error(result, identifier, NULL);
       return result;
     }
   }
@@ -1361,6 +1413,7 @@ static PyObject* Rules_match(
 
   PyObject* externals = NULL;
   PyObject* fast = NULL;
+  YR_SCANNER* scanner = NULL;
 
   Rules* object = (Rules*) self;
 
@@ -1426,14 +1479,23 @@ static PyObject* Rules_match(
       }
     }
 
+    if (fast != NULL)
+    {
+      fast_mode = (PyObject_IsTrue(fast) == 1);
+    }
+
+    error = yr_scanner_create(object->rules, &scanner);
+    if (error != ERROR_SUCCESS)
+    {
+      return handle_error(error, NULL, NULL);
+    }
+
     if (externals != NULL && externals != Py_None)
     {
       if (PyDict_Check(externals))
       {
-        if (process_match_externals(externals, object->rules) != ERROR_SUCCESS)
+        if (process_match_externals(externals, scanner) != ERROR_SUCCESS)
         {
-          // Restore original externals provided during compiling.
-          process_match_externals(object->externals, object->rules);
           return NULL;
         }
       }
@@ -1445,10 +1507,9 @@ static PyObject* Rules_match(
       }
     }
 
-    if (fast != NULL)
-    {
-      fast_mode = (PyObject_IsTrue(fast) == 1);
-    }
+    yr_scanner_set_callback(scanner, yara_callback, &callback_data);
+    yr_scanner_set_flags(scanner, fast_mode ? SCAN_FLAGS_FAST_MODE : 0);
+    yr_scanner_set_timeout(scanner, timeout);
 
     if (filepath != NULL)
     {
@@ -1456,13 +1517,7 @@ static PyObject* Rules_match(
 
       Py_BEGIN_ALLOW_THREADS
 
-      error = yr_rules_scan_file(
-          object->rules,
-          filepath,
-          fast_mode ? SCAN_FLAGS_FAST_MODE : 0,
-          yara_callback,
-          &callback_data,
-          timeout);
+      error = yr_scanner_scan_file(scanner, filepath);
 
       Py_END_ALLOW_THREADS
     }
@@ -1472,14 +1527,10 @@ static PyObject* Rules_match(
 
       Py_BEGIN_ALLOW_THREADS
 
-      error = yr_rules_scan_mem(
-          object->rules,
+      error = yr_scanner_scan_mem(
+          scanner,
           (unsigned char*) data,
-          (size_t) length,
-          fast_mode ? SCAN_FLAGS_FAST_MODE : 0,
-          yara_callback,
-          &callback_data,
-          timeout);
+          (size_t) length);
 
       Py_END_ALLOW_THREADS
     }
@@ -1489,26 +1540,11 @@ static PyObject* Rules_match(
 
       Py_BEGIN_ALLOW_THREADS
 
-      error = yr_rules_scan_proc(
-          object->rules,
-          pid,
-          fast_mode ? SCAN_FLAGS_FAST_MODE : 0,
-          yara_callback,
-          &callback_data,
-          timeout);
+      error = yr_scanner_scan_proc(
+          scanner,
+          pid);
 
       Py_END_ALLOW_THREADS
-    }
-
-    // Restore original externals provided during compiling.
-    if (object->externals != NULL)
-    {
-      if (process_match_externals(
-            object->externals, object->rules) != ERROR_SUCCESS)
-      {
-        Py_DECREF(callback_data.matches);
-        return NULL;
-      }
     }
 
     if (error != ERROR_SUCCESS)
@@ -1519,15 +1555,15 @@ static PyObject* Rules_match(
       {
         if (filepath != NULL)
         {
-          handle_error(error, filepath);
+          handle_error(error, filepath, scanner);
         }
         else if (data != NULL)
         {
-          handle_error(error, "<data>");
+          handle_error(error, "<data>", scanner);
         }
         else if (pid != 0)
         {
-          handle_error(error, "<proc>");
+          handle_error(error, "<proc>", scanner);
         }
 
         #ifdef PROFILING_ENABLED
@@ -1543,8 +1579,11 @@ static PyObject* Rules_match(
         #endif
       }
 
+      yr_scanner_destroy(scanner);
       return NULL;
     }
+
+    yr_scanner_destroy(scanner);
   }
 
   return callback_data.matches;
@@ -1584,7 +1623,7 @@ static PyObject* Rules_save(
     Py_END_ALLOW_THREADS
 
     if (error != ERROR_SUCCESS)
-      return handle_error(error, filepath);
+      return handle_error(error, filepath, NULL);
   }
   else if (file != NULL && PyObject_HasAttrString(file, "write"))
   {
@@ -1598,7 +1637,7 @@ static PyObject* Rules_save(
     Py_END_ALLOW_THREADS;
 
     if (error != ERROR_SUCCESS)
-      return handle_error(error, "<file-like-object>");
+      return handle_error(error, "<file-like-object>", NULL);
   }
   else
   {
@@ -1859,7 +1898,7 @@ static PyObject* yara_set_config(
           &stack_size);
 
       if ( error != ERROR_SUCCESS)
-        return handle_error(error, NULL);
+        return handle_error(error, NULL, NULL);
     }
 
     if (max_strings_per_rule != 0)
@@ -1869,7 +1908,7 @@ static PyObject* yara_set_config(
 				  &max_strings_per_rule);
 
       if (error != ERROR_SUCCESS)
-        return handle_error(error, NULL);
+        return handle_error(error, NULL, NULL);
     }
   }
 
@@ -1930,7 +1969,7 @@ static PyObject* yara_compile(
     error = yr_compiler_create(&compiler);
 
     if (error != ERROR_SUCCESS)
-      return handle_error(error, NULL);
+      return handle_error(error, NULL, NULL);
 
     yr_compiler_set_callback(compiler, raise_exception_on_error, NULL);
 
@@ -2152,12 +2191,12 @@ static PyObject* yara_compile(
         else
         {
           Py_DECREF(rules);
-          result = handle_error(error, NULL);
+          result = handle_error(error, NULL, NULL);
         }
       }
       else
       {
-        result = handle_error(ERROR_INSUFFICIENT_MEMORY, NULL);
+        result = handle_error(ERROR_INSUFFICIENT_MEMORY, NULL, NULL);
       }
     }
 
@@ -2211,7 +2250,7 @@ static PyObject* yara_load(
     if (error != ERROR_SUCCESS)
     {
       Py_DECREF(rules);
-      return handle_error(error, filepath);
+      return handle_error(error, filepath, NULL);
     }
   }
   else if (file != NULL && PyObject_HasAttrString(file, "read"))
@@ -2233,7 +2272,7 @@ static PyObject* yara_load(
     if (error != ERROR_SUCCESS)
     {
       Py_DECREF(rules);
-      return handle_error(error, "<file-like-object>");
+      return handle_error(error, "<file-like-object>", NULL);
     }
   }
   else
